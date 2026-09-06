@@ -122,8 +122,10 @@ tables the override was generated from are kept in
 
 `tests/corpus.sh` runs `analyze` and `patch` over every Dell dump in a checkout
 of [linuxhw/ACPI](https://github.com/linuxhw/ACPI). Results for the September
-2026 collection are in `docs/corpus-results.md`. Booted and measured on an XPS
-15 9500 (BIOS 1.40.0).
+2026 collection are in `docs/corpus-results.md`: 40 of 61 patched and compiled, the
+rest have no DPTF path through the ladders, none failed. Installed from the
+running firmware, booted and verified on an XPS 15 9500 (BIOS 1.40.0): 38 parse
+ops per sensor read instead of 881, no new ACPI errors.
 
 ## Safety
 
