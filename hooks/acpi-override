@@ -1,0 +1,29 @@
+#!/bin/sh
+# initramfs-tools hook: prepend an uncompressed cpio carrying replacement ACPI tables
+# (kernel/firmware/acpi/*.aml) so the kernel's table-upgrade mechanism swaps them in
+# before ACPICA loads. Tables live in /lib/firmware/acpi-override/. The override is
+# only built if the running BIOS version matches the one the tables were made for.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+
+SRC=/lib/firmware/acpi-override
+[ -d "$SRC" ] || exit 0
+ls "$SRC"/*.aml >/dev/null 2>&1 || exit 0
+
+if [ -r "$SRC/BIOS_VERSION" ] && [ -r /sys/class/dmi/id/bios_version ]; then
+	want=$(cat "$SRC/BIOS_VERSION"); have=$(cat /sys/class/dmi/id/bios_version)
+	if [ "$want" != "$have" ]; then
+		echo "W: acpi-override: BIOS is $have, tables were made for $want; NOT adding the override. Re-dump and re-check the tables." >&2
+		exit 0
+	fi
+fi
+
+TMP=$(mktemp -d)
+mkdir -p "$TMP/kernel/firmware/acpi"
+cp "$SRC"/*.aml "$TMP/kernel/firmware/acpi/"
+( cd "$TMP" && find kernel | cpio -H newc --create --quiet > "$TMP/acpi_override.cpio" )
+prepend_earlyinitramfs "$TMP/acpi_override.cpio"
+echo "I: acpi-override: added $(ls "$SRC"/*.aml | xargs -n1 basename | tr '\n' ' ')for BIOS $(cat "$SRC/BIOS_VERSION" 2>/dev/null)" >&2
+rm -rf "$TMP"

@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""ec-ladder-override: take the EC if-ladder out of Dell's DPTF sensor path.
+
+Dell laptop firmware reads embedded-controller registers through two generic
+accessors, ECW1(reg, value) and ECR1(reg), written as flat if-ladders with one
+block per register (50 to 137 blocks depending on the model). Every DPTF sensor
+read (_TMP) goes through both, so one temperature costs the AML interpreter
+roughly 880 parse ops for two EC bytes. This tool rewrites the DPTF SSDT so that
+call sites with a constant register number access the named EC field directly,
+keeping the original call as the fallback for the early-boot case where the EC
+region is not yet available (ECRD == 0). The result is loaded at boot through
+the kernel's ACPI table-upgrade mechanism from an initramfs hook.
+
+Subcommands:
+  dump      copy the firmware tables from /sys/firmware/acpi/tables (root) or
+            extract them from an acpidump text file
+  analyze   report the ladders, the DPTF table and the rewritable call sites
+  patch     produce the patched SSDT (.aml, .dsl and a diff)
+  install   put the table and the initramfs hook in place, rebuild initrds
+  verify    check the running system loaded the override
+  uninstall remove the hook and the table, rebuild initrds
+
+Needs iasl and acpixtract (package acpica-tools on Debian/Ubuntu).
+"""
+import argparse, os, re, shutil, subprocess, sys, tempfile, glob, difflib
+
+OVERRIDE_DIR = "/lib/firmware/acpi-override"
+HOOK_DST = "/etc/initramfs-tools/hooks/acpi-override"
+HOOK_SRC_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "acpi-override"),
+    "/usr/share/dell-ec-ladder-override/acpi-override",
+    "/usr/local/share/dell-ec-ladder-override/acpi-override",
+]
+CONST = r'(?:0x[0-9A-Fa-f]+|One|Zero|\d+)'
+PFX = r'((?:\\?[A-Za-z0-9_^]+\.)*)'
+
+
+def die(msg, code=1):
+    print("error: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def need(tool):
+    if not shutil.which(tool):
+        die(f"{tool} not found; install acpica-tools")
+
+
+def const_int(s):
+    return {"One": 1, "Zero": 0}.get(s) if s in ("One", "Zero") else int(s, 0)
+
+
+# --------------------------------------------------------------------- tables
+def load_tables(path):
+    """Return {name: bytes} for DSDT and SSDTs from a directory of .aml/.dat files,
+    a /sys/firmware/acpi/tables-like directory, or an acpidump text file."""
+    tables = {}
+    if os.path.isdir(path):
+        for f in sorted(os.listdir(path)):
+            fp = os.path.join(path, f)
+            if not os.path.isfile(fp):
+                continue
+            try:
+                b = open(fp, "rb").read()
+            except PermissionError:
+                die(f"cannot read {fp}; run as root or copy the tables first (see: dump)")
+            if len(b) > 36 and b[:4] in (b"DSDT", b"SSDT"):
+                tables[f] = b
+        if not tables:
+            die(f"no DSDT/SSDT tables found in {path}")
+        return tables
+    # acpidump text: extract with acpixtract
+    need("acpixtract")
+    with tempfile.TemporaryDirectory() as td:
+        r = run(["acpixtract", "-a", os.path.abspath(path)], cwd=td)
+        if r.returncode != 0:
+            die("acpixtract failed:\n" + r.stdout + r.stderr)
+        return load_tables(td)
+
+
+def table_header(b):
+    return dict(sig=b[:4].decode(), length=int.from_bytes(b[4:8], "little"), rev=b[8],
+                oem_id=b[10:16].decode(errors="replace"), oem_table_id=b[16:24].decode(errors="replace"),
+                oem_rev=int.from_bytes(b[24:28], "little"))
+
+
+class Work:
+    """Decompiled view of a table set."""
+
+    def __init__(self, tables, tmp):
+        need("iasl")
+        self.tmp = tmp
+        self.files = {}
+        for name, b in tables.items():
+            h = table_header(b)
+            fn = f"{h['sig'].lower()}-{re.sub(r'[^A-Za-z0-9]', '_', h['oem_table_id'].strip()) or 'x'}-{len(self.files)}.aml"
+            with open(os.path.join(tmp, fn), "wb") as f:
+                f.write(b)
+            self.files[fn] = h
+        self.dsdt = next(f for f, h in self.files.items() if h["sig"] == "DSDT")
+        self.dsl = {}
+
+    def decompile(self, fn):
+        """Disassemble one table. The DSDT needs no external resolution for what we
+        parse from it; an SSDT is tried with the DSDT only, then with every table,
+        because some firmware ships SSDT pairs that conflict when loaded together."""
+        if fn in self.dsl:
+            return self.dsl[fn]
+        out = os.path.join(self.tmp, fn[:-4] + ".dsl")
+        attempts = [[]] if fn == self.dsdt else [[self.dsdt], [f for f in self.files if f != fn]]
+        last = None
+        for ext in attempts:
+            if os.path.exists(out):
+                os.remove(out)
+            last = run(["iasl"] + [x for f in ext for x in ("-e", f)] + ["-d", fn], cwd=self.tmp)
+            if os.path.exists(out):
+                break
+        if not os.path.exists(out):
+            die(f"iasl could not disassemble {fn}:\n{last.stdout[-2000:]}{last.stderr[-2000:]}")
+        self.dsl[fn] = open(out, encoding="utf-8", errors="replace").read()
+        return self.dsl[fn]
+
+
+# ------------------------------------------------------------------- analysis
+def find_method(text, name):
+    m = re.search(r'^(\s*)Method \(' + re.escape(name) + r', (\d)[^\n]*\n', text, re.M)
+    if not m:
+        return None
+    i = text.find("{", m.end())
+    depth, j = 0, i
+    while j < len(text):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    return text[i:j + 1]
+
+
+def ladder_maps(dsdt_dsl):
+    """Parse ECR1/ECW1: {register: field name} for reads and writes, plus ladder lengths."""
+    reads, writes = {}, {}
+    r1 = find_method(dsdt_dsl, "ECR1")
+    w1 = find_method(dsdt_dsl, "ECW1")
+    if r1:
+        for c, f in re.findall(r'If \(\(Arg0 == (' + CONST + r')\)\)\s*\{\s*Local0 = ([A-Z_][A-Z0-9_]{3})', r1):
+            reads[const_int(c)] = f
+    if w1:
+        for c, f in re.findall(r'If \(\(Arg0 == (' + CONST + r')\)\)\s*\{\s*([A-Z_][A-Z0-9_]{3}) = Arg1', w1):
+            writes[const_int(c)] = f
+    lr = len(re.findall(r'If \(\(Arg0 == ' + CONST + r'\)\)', r1)) if r1 else 0
+    lw = len(re.findall(r'If \(\(Arg0 == ' + CONST + r'\)\)', w1)) if w1 else 0
+    return reads, writes, lr, lw
+
+
+def find_dptf(work):
+    """The SSDT that holds the DPTF sensors: has _TMP methods and DPTF device ids."""
+    best = None
+    for fn, h in work.files.items():
+        if h["sig"] != "SSDT":
+            continue
+        raw = open(os.path.join(work.tmp, fn), "rb").read()
+        if b"_TMP" not in raw:
+            continue
+        score = raw.count(b"_TMP") + (10 if b"Dptf" in h["oem_table_id"].encode() else 0)
+        if b"INT3403" in raw or re.search(rb"INTC10[0-9A-F]{2}", raw):
+            score += 5
+        if best is None or score > best[0]:
+            best = (score, fn)
+    return best[1] if best else None
+
+
+RE_W = re.compile(r'^(\s*)' + PFX + r'ECW1 \((' + CONST + r'), (.+)\)\s*$', re.M)
+RE_R = re.compile(r'^(\s*)(.+?) = ' + PFX + r'ECR1 \((' + CONST + r')\)\s*$', re.M)
+RE_XR = re.compile(r'^(\s*)(.+?) = ' + PFX + r'EXRW \((.+?), (' + CONST + r'), Zero, Zero\)\s*$', re.M)
+RE_XW = re.compile(r'^(\s*)' + PFX + r'EXRW \((.+?), (' + CONST + r'), (' + CONST + r'), (.+)\)\s*$', re.M)
+
+
+def ec_scope(dsl):
+    m = re.search(r'(\\[A-Za-z0-9_.^]+)\.EC[WR]1 \(', dsl)
+    return m.group(1) if m else None
+
+
+def plan(work):
+    dsdt = work.decompile(work.dsdt)
+    reads, writes, lr, lw = ladder_maps(dsdt)
+    dptf = find_dptf(work)
+    info = dict(ladder_read=lr, ladder_write=lw, n_read_map=len(reads), n_write_map=len(writes),
+                dptf=dptf, sites=[], scope=None)
+    if not dptf:
+        return info
+    dsl = work.decompile(dptf)
+    info["scope"] = ec_scope(dsl)
+    for m in RE_W.finditer(dsl):
+        c = const_int(m.group(3))
+        info["sites"].append(("write", c, writes.get(c), m.group(0).strip()))
+    for m in RE_R.finditer(dsl):
+        c = const_int(m.group(4))
+        info["sites"].append(("read", c, reads.get(c), m.group(0).strip()))
+    for m in RE_XR.finditer(dsl):
+        c = const_int(m.group(5))
+        info["sites"].append(("exrw-read", c, (writes.get(0x33), reads.get(c)), m.group(0).strip()))
+    for m in RE_XW.finditer(dsl):
+        if const_int(m.group(5)) == 0:
+            continue
+        c = const_int(m.group(4))
+        info["sites"].append(("exrw-write", c, (writes.get(0x33), writes.get(c)), m.group(0).strip()))
+    return info
+
+
+# --------------------------------------------------------------------- rewrite
+def rewrite(dsl, reads, writes, scope):
+    """Return (new_dsl, count, fields_used). Each rewritten statement becomes
+    If (\\ECRD) { direct } Else { original }."""
+    used = set()
+    count = 0
+
+    def fld(name):
+        used.add(name)
+        return f"{scope}.{name}"
+
+    def block(ind, direct_lines, orig):
+        inner = ind + "    "
+        return (f"{ind}If (\\ECRD)\n{ind}{{\n" + "".join(inner + l + "\n" for l in direct_lines) +
+                f"{ind}}}\n{ind}Else\n{ind}{{\n{inner}{orig.strip()}\n{ind}}}")
+
+    def sub_w(m):
+        nonlocal count
+        c = const_int(m.group(3))
+        if c not in writes:
+            return m.group(0)
+        count += 1
+        return block(m.group(1), [f"{fld(writes[c])} = {m.group(4)}"], m.group(0))
+
+    def sub_r(m):
+        nonlocal count
+        c = const_int(m.group(4))
+        if c not in reads:
+            return m.group(0)
+        count += 1
+        return block(m.group(1), [f"{m.group(2)} = {fld(reads[c])}"], m.group(0))
+
+    def sub_xr(m):
+        nonlocal count
+        c = const_int(m.group(5))
+        if 0x33 not in writes or c not in reads:
+            return m.group(0)
+        count += 1
+        return block(m.group(1), [f"{fld(writes[0x33])} = {m.group(4)}", f"{m.group(2)} = {fld(reads[c])}"], m.group(0))
+
+    def sub_xw(m):
+        nonlocal count
+        if const_int(m.group(5)) == 0:
+            return m.group(0)
+        c = const_int(m.group(4))
+        if 0x33 not in writes or c not in writes:
+            return m.group(0)
+        count += 1
+        return block(m.group(1), [f"{fld(writes[0x33])} = {m.group(3)}", f"{fld(writes[c])} = {m.group(6)}"], m.group(0))
+
+    dsl = RE_XR.sub(sub_xr, dsl)
+    dsl = RE_XW.sub(sub_xw, dsl)
+    dsl = RE_W.sub(sub_w, dsl)
+    dsl = RE_R.sub(sub_r, dsl)
+    return dsl, count, used
+
+
+def add_externals(dsl, scope, fields):
+    lines = [f"    External ({scope}.{f}, FieldUnitObj)" for f in sorted(fields)
+             if f"External ({scope}.{f}," not in dsl]
+    if not re.search(r'External \(\\?ECRD, IntObj\)', dsl):
+        lines.append("    External (\\ECRD, IntObj)")
+    if not lines:
+        return dsl
+    # after the last existing External line, else right after the DefinitionBlock brace
+    ext = list(re.finditer(r'^    External \([^\n]*\n', dsl, re.M))
+    pos = ext[-1].end() if ext else dsl.find("{", dsl.find("DefinitionBlock")) + 2
+    return dsl[:pos] + "\n".join(lines) + "\n" + dsl[pos:]
+
+
+def bump_oem_rev(dsl):
+    m = re.search(r'(DefinitionBlock \("", "SSDT", \d, "[^"]*", "[^"]*", )(0x[0-9A-Fa-f]+)\)', dsl)
+    if not m:
+        die("DefinitionBlock header not found in DPTF table")
+    new = int(m.group(2), 16) + 1
+    return dsl[:m.start(2)] + f"0x{new:08X}" + dsl[m.end(2):], int(m.group(2), 16), new
+
+
+def do_patch(work, out_dir, quiet=False):
+    p = plan(work)
+    if not p["dptf"]:
+        die("no DPTF sensor table (SSDT with _TMP methods) found")
+    if not p["scope"]:
+        die("the DPTF table does not call ECW1/ECR1; nothing to rewrite (not a Dell EC-ladder firmware?)")
+    dsdt = work.decompile(work.dsdt)
+    reads, writes, _, _ = ladder_maps(dsdt)
+    dsl = work.decompile(p["dptf"])
+    new, count, used = rewrite(dsl, reads, writes, p["scope"])
+    if count == 0:
+        die("no rewritable call sites found")
+    new = add_externals(new, p["scope"], used)
+    new, old_rev, new_rev = bump_oem_rev(new)
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.join(out_dir, "SSDT-dptf-patched")
+    with open(base + ".dsl", "w") as f:
+        f.write(new)
+    r = run(["iasl", "-ve", "-p", base, base + ".dsl"])
+    if not os.path.exists(base + ".aml"):
+        die("iasl failed to compile the patched table:\n" + r.stdout[-3000:] + r.stderr[-3000:])
+    with open(os.path.join(out_dir, "SSDT-dptf.diff"), "w") as f:
+        f.write("".join(difflib.unified_diff(dsl.splitlines(True), new.splitlines(True), "stock.dsl", "patched.dsl")))
+    shutil.copy(os.path.join(work.tmp, p["dptf"]), os.path.join(out_dir, "SSDT-dptf-stock.aml"))
+    h = table_header(open(base + ".aml", "rb").read())
+    if not quiet:
+        print(f"patched table: {base}.aml  ({h['sig']} {h['oem_id']!r} {h['oem_table_id']!r} OEM rev 0x{old_rev:X} -> 0x{new_rev:X})")
+        print(f"rewrote {count} call sites through {len(used)} EC fields: {' '.join(sorted(used))}")
+        print(f"diff: {os.path.join(out_dir, 'SSDT-dptf.diff')}")
+    return base + ".aml", count
+
+
+# ------------------------------------------------------------------- commands
+def cmd_dump(a):
+    os.makedirs(a.out, exist_ok=True)
+    if a.from_acpidump:
+        t = load_tables(a.from_acpidump)
+    else:
+        src = "/sys/firmware/acpi/tables"
+        if not os.access(src, os.R_OK) or not os.access(os.path.join(src, "DSDT"), os.R_OK):
+            die(f"cannot read {src}; run as root")
+        t = load_tables(src)
+    for name, b in t.items():
+        with open(os.path.join(a.out, name if name.endswith((".aml", ".dat")) else name + ".aml"), "wb") as f:
+            f.write(b)
+    print(f"wrote {len(t)} tables to {a.out}")
+
+
+def cmd_analyze(a):
+    tables = load_tables(a.source)
+    with tempfile.TemporaryDirectory() as td:
+        w = Work(tables, td)
+        p = plan(w)
+        h = w.files[w.dsdt]
+        print(f"DSDT: OEM {h['oem_id']!r} table id {h['oem_table_id']!r}")
+        print(f"ECR1 ladder: {p['ladder_read']} blocks ({p['n_read_map']} registers mapped); ECW1 ladder: {p['ladder_write']} blocks ({p['n_write_map']} mapped)")
+        if not p["dptf"]:
+            print("DPTF sensor table: none found")
+            return 2
+        hd = w.files[p["dptf"]]
+        print(f"DPTF table: {p['dptf']} (OEM {hd['oem_id']!r} id {hd['oem_table_id']!r} rev 0x{hd['oem_rev']:X}); EC scope {p['scope']}")
+        ok = [s for s in p["sites"] if s[2] and (not isinstance(s[2], tuple) or all(s[2]))]
+        print(f"rewritable call sites: {len(ok)} of {len(p['sites'])}")
+        for kind, c, f, line in p["sites"]:
+            flag = "ok " if (f and (not isinstance(f, tuple) or all(f))) else "no "
+            print(f"  {flag}{kind:10s} reg 0x{c:02X} -> {f}   {line[:80]}")
+        return 0 if ok else 2
+
+
+def cmd_patch(a):
+    tables = load_tables(a.source)
+    with tempfile.TemporaryDirectory() as td:
+        w = Work(tables, td)
+        do_patch(w, a.out)
+
+
+def bios_version():
+    try:
+        return open("/sys/class/dmi/id/bios_version").read().strip()
+    except OSError:
+        return ""
+
+
+def cmd_install(a):
+    if os.geteuid() != 0:
+        die("install needs root")
+    aml = a.table
+    if aml is None:
+        if os.path.exists(os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml")):
+            die("an override is already installed; the running tables are not stock. "
+                "Use --table with a table patched from the stock tables (kept in "
+                f"{OVERRIDE_DIR}/stock), or uninstall, reboot and install again")
+        tables = load_tables("/sys/firmware/acpi/tables")
+        with tempfile.TemporaryDirectory() as td:
+            w = Work(tables, td)
+            aml, _ = do_patch(w, os.path.join(td, "out"))
+            os.makedirs(os.path.join(OVERRIDE_DIR, "stock"), exist_ok=True)
+            for name, b in tables.items():
+                with open(os.path.join(OVERRIDE_DIR, "stock", name + ".aml"), "wb") as f:
+                    f.write(b)
+            shutil.copy(aml, os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml"))
+            shutil.copy(os.path.join(td, "out", "SSDT-dptf.diff"), os.path.join(OVERRIDE_DIR, "SSDT-dptf.diff"))
+    else:
+        os.makedirs(OVERRIDE_DIR, exist_ok=True)
+        shutil.copy(aml, os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml"))
+    with open(os.path.join(OVERRIDE_DIR, "BIOS_VERSION"), "w") as f:
+        f.write((a.bios_version or bios_version()) + "\n")
+    hook = next((h for h in HOOK_SRC_CANDIDATES if os.path.exists(h)), None)
+    if not hook:
+        die("initramfs hook not found next to this script (hooks/acpi-override)")
+    shutil.copy(hook, HOOK_DST)
+    os.chmod(HOOK_DST, 0o755)
+    print(f"installed {OVERRIDE_DIR}/SSDT-dptf.aml (BIOS {open(os.path.join(OVERRIDE_DIR, 'BIOS_VERSION')).read().strip()}) and {HOOK_DST}")
+    r = subprocess.run(["update-initramfs", "-u", "-k", "all"])
+    if r.returncode != 0:
+        die("update-initramfs failed")
+    print("reboot, then run: ec-ladder-override verify")
+
+
+def cmd_verify(a):
+    inst = os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml")
+    if not os.path.exists(inst):
+        die(f"{inst} not installed")
+    want = table_header(open(inst, "rb").read())
+    found = None
+    for f in glob.glob("/sys/firmware/acpi/tables/SSDT*"):
+        try:
+            h = table_header(open(f, "rb").read())
+        except PermissionError:
+            die("run as root to read /sys/firmware/acpi/tables")
+        if h["oem_table_id"] == want["oem_table_id"] and h["oem_id"] == want["oem_id"]:
+            found = (f, h)
+    if not found:
+        die("no loaded table matches the installed one")
+    f, h = found
+    ok = h["oem_rev"] == want["oem_rev"]
+    print(f"loaded {f}: {h['oem_table_id']!r} OEM rev 0x{h['oem_rev']:X}; installed override rev 0x{want['oem_rev']:X}: {'ACTIVE' if ok else 'NOT loaded (stock table running)'}")
+    r = run(["dmesg"])
+    for line in r.stdout.splitlines():
+        if "Table Upgrade" in line:
+            print("  " + line.strip())
+    sys.exit(0 if ok else 3)
+
+
+def cmd_uninstall(a):
+    if os.geteuid() != 0:
+        die("uninstall needs root")
+    for p in (HOOK_DST,):
+        if os.path.exists(p):
+            os.remove(p)
+    if os.path.isdir(OVERRIDE_DIR):
+        shutil.rmtree(OVERRIDE_DIR)
+    subprocess.run(["update-initramfs", "-u", "-k", "all"])
+    print("removed; the stock table is used after the next reboot")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ec-ladder-override", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    d = sp.add_parser("dump", help="copy firmware tables to a directory"); d.add_argument("--out", default="acpi-tables"); d.add_argument("--from-acpidump", help="acpidump text file instead of /sys"); d.set_defaults(fn=cmd_dump)
+    z = sp.add_parser("analyze", help="report ladders and rewritable sites"); z.add_argument("source", help="tables directory, /sys/firmware/acpi/tables, or acpidump text file"); z.set_defaults(fn=cmd_analyze)
+    p = sp.add_parser("patch", help="produce the patched DPTF table"); p.add_argument("source"); p.add_argument("--out", default="patched"); p.set_defaults(fn=cmd_patch)
+    i = sp.add_parser("install", help="install table + initramfs hook (root)"); i.add_argument("--table", help="patched .aml (default: patch the running firmware)"); i.add_argument("--bios-version"); i.set_defaults(fn=cmd_install)
+    v = sp.add_parser("verify", help="check the override is loaded"); v.set_defaults(fn=cmd_verify)
+    u = sp.add_parser("uninstall", help="remove table + hook (root)"); u.set_defaults(fn=cmd_uninstall)
+    a = ap.parse_args()
+    rc = a.fn(a)
+    sys.exit(rc or 0)
+
+
+if __name__ == "__main__":
+    main()
