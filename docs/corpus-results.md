@@ -1,10 +1,10 @@
 # Corpus results, linuxhw/ACPI, September 2026
 
-`tests/corpus.sh` over every Dell notebook and convertible dump (61 machines). `ok` means analyze found rewritable sites and the patched table compiled.
+`tests/corpus.sh` over every Dell notebook and convertible dump (61 machines). `ok` means both the DPTF table and the rebalanced DSDT were produced and compiled; `ok-ssdt` means the DPTF table only, because the DSDT did not recompile for a reason outside the accepted list.
 
 ```
 model                              result   detail
-Latitude 7400 2-in-1               ok       ECR1 ladder: 107 blocks (107 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
+Latitude 7400 2-in-1               ok-ssdt  ECR1 ladder: 107 blocks (107 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 G3 3500                            ok       ECR1 ladder: 111 blocks (111 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 G3 3579                            ok       ECR1 ladder: 106 blocks (106 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 Inspiron 14-3462                   no-sites ECR1 ladder: 0 blocks (0 registers mapped); ECW1 ladder: 0 blocks (0 mapped)
@@ -49,7 +49,7 @@ Precision 7710                     ok       ECR1 ladder: 57 blocks (57 registers
 Precision 7710                     ok       ECR1 ladder: 57 blocks (57 registers map | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 Precision M4500                    no-dptf  
 Venue 8 Pro 5830                   no-sites ECR1 ladder: 0 blocks (0 registers mapped); ECW1 ladder: 0 blocks (0 mapped)
-Vostro 5471                        ok       ECR1 ladder: 106 blocks (106 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
+Vostro 5471                        ok-ssdt  ECR1 ladder: 106 blocks (106 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 XPS 13 7390                        ok       ECR1 ladder: 107 blocks (107 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 XPS 13 9350                        ok       ECR1 ladder: 57 blocks (57 registers map | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 XPS 13 9360                        ok       ECR1 ladder: 106 blocks (106 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
@@ -60,7 +60,7 @@ XPS 15 9510                        ok       ECR1 ladder: 135 blocks (135 registe
 XPS 15 9570                        ok       ECR1 ladder: 106 blocks (106 registers m | rewrote 19 call sites through 7 EC fields: EC50 EC51 EC52 EC53 
 XPS L501X                          no-dptf  
 
-totals: 40 ok, 8 without DPTF table, 7 without rewritable sites, 0 failed  
+totals: 38 ok (both tables), 2 DPTF table only, 8 without DPTF table, 7 without rewritable sites, 0 failed  
 ```
 
-`no-dptf`: pre-2015 machines without a DPTF sensor table, nothing to do. `no-sites`: a DPTF table exists but its sensor methods do not call the ladders with constant register numbers (2015-era Inspiron and Latitude 5414 use a different sensor path); those machines are left alone. The Precision 5560/5570 and XPS 15 9510 rewrite 24 sites because their tables also drive fan and threshold registers through the accessors.
+`no-dptf`: pre-2015 machines without a DPTF sensor table, nothing to do. `no-sites`: a DPTF table exists but its sensor methods do not call the ladders with constant register numbers (2015-era Inspiron and the Latitude 5414 use a different sensor path); those machines are left alone. Two machines get the DPTF table only. The Precision 5560/5570 and XPS 15 9510 rewrite 24 sites because their tables also drive fan and threshold registers through the accessors.

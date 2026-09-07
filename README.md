@@ -1,8 +1,8 @@
 # dell-ec-ladder-override
 
-Take the embedded-controller if-ladder out of Dell's DPTF sensor path, from a
-running Linux system or from a firmware dump, and load the patched table at boot
-through an initramfs hook.
+Take the embedded-controller if-ladders out of Dell laptop firmware, from a
+running Linux system or from a firmware dump, and load the patched tables at
+boot through an initramfs hook.
 
 ## The problem
 
@@ -27,11 +27,14 @@ state objects for two EC bytes. thermald reads three sensors every few seconds;
 Intel's DPTF service on Windows reads the same methods. Measured on an XPS 15
 9500 (Ubuntu 26.04, kernel 7.0):
 
-| per `_TMP` read | stock firmware | with this override |
+| per evaluation | stock firmware | with this override |
 |---|---|---|
-| parse ops | 881 | 37 |
-| CPU time | 2.65 ms | about 0.5 ms |
-| package energy above idle | 11.5 mJ | about 6 mJ (the EC floor) |
+| `_TMP` sensor read (thermald), parse ops | 881 | 38 |
+| `_TMP` CPU time | 2.65 ms | about 0.5 ms |
+| `_TMP` package energy above idle | 11.5 mJ | about 6 mJ (the EC floor) |
+| `_BST` battery status (upower every 30 s), parse ops | 4,383 | 621 |
+| lid or charger read, parse ops | about 500 | 77 |
+| all AML interpreter ops on the machine in 120 s | about 103,000 | 7,800 |
 
 A survey of 783 public ACPI dumps found the pattern on 55 of 61 Dell notebooks,
 from 2011 to 2023, and on no other vendor's. Lenovo, HP and ASUS read the same
@@ -40,9 +43,11 @@ measurements and the survey are in the write-up linked at the bottom.
 
 ## What the tool does
 
-`ec-ladder-override patch` disassembles the firmware tables, parses the two
-ladders in the DSDT to learn which EC field each register number names, and
-rewrites every call site in the DPTF SSDT that uses a constant register number:
+`ec-ladder-override patch` produces two tables.
+
+**The DPTF SSDT**, with every call site that uses a constant register number
+rewritten to access the named EC field directly. The tool parses the two
+ladders in the DSDT to learn which field each register number names:
 
 ```
 \_SB.PCI0.LPCB.ECDV.ECW1 (0x33, Arg0)          If (\ECRD)
@@ -61,7 +66,18 @@ accessors themselves check. Reads, writes, and the newer `EXRW(index, reg, 0, 0)
 helper used by 2021 and later Dells are handled. Nothing else in the table
 changes; the OEM revision is bumped by one so the loaded table is identifiable.
 
-`ec-ladder-override install` puts the table in `/lib/firmware/acpi-override/`,
+**The DSDT**, with `ECR1` and `ECW1` themselves rebuilt: the flat list of one
+`If` per register becomes a balanced tree of range comparisons, seven deep
+for 117 registers. Every caller in the DSDT gets the benefit without being
+touched: the battery status upower polls every 30 seconds (four ladder walks
+per poll), the lid switch, the charger check, the wake-event handler. The
+early-boot fallback and the per-register equality tests are kept, so an
+unmapped register still matches nothing. The DSDT is a large table and
+recompiling a decompiled one is fussy; see `docs/design.md` for what the tool
+repairs and which compiler complaints it accepts. When the DSDT cannot be
+recompiled the tool keeps the DPTF table only and says so.
+
+`ec-ladder-override install` puts the tables in `/lib/firmware/acpi-override/`,
 installs an initramfs-tools hook that prepends it as an uncompressed early cpio
 (the same mechanism the CPU microcode hooks use), and rebuilds every initrd. The
 kernel's ACPI table-upgrade mechanism then replaces the firmware's copy before
@@ -83,8 +99,9 @@ ACPICA loads, on every boot, through kernel updates, with no GRUB changes.
 # what would be done, without touching anything (root, to read /sys)
 sudo ec-ladder-override analyze /sys/firmware/acpi/tables
 
-# generate the table into ./patched (aml, dsl, and a diff against stock)
+# generate the tables into ./patched (aml, dsl, and a diff against stock for each)
 sudo ec-ladder-override patch /sys/firmware/acpi/tables --out patched
+#   add --no-dsdt to leave the DSDT alone and fix the sensor path only
 
 # install: patches the running firmware, keeps a copy of the stock tables,
 # installs the hook, rebuilds initrds
@@ -93,7 +110,9 @@ sudo reboot
 
 # afterwards
 sudo ec-ladder-override verify
-#   loaded /sys/firmware/acpi/tables/SSDT2: 'DptfTabl' OEM rev 0x1001; installed override rev 0x1001: ACTIVE
+#   DSDT.aml -> /sys/firmware/acpi/tables/DSDT: 'Dell Inc' loaded rev 0x20170002, override rev 0x20170002: ACTIVE
+#   SSDT-dptf.aml -> /sys/firmware/acpi/tables/SSDT2: 'DptfTabl' loaded rev 0x1001, override rev 0x1001: ACTIVE
+#     ACPI: Table Upgrade: override [DSDT-DELL  -Dell Inc]
 #     ACPI: Table Upgrade: override [SSDT-INTEL -DptfTabl]
 
 # remove
@@ -116,16 +135,18 @@ override at initramfs build time if the running BIOS differs. That protects
 rebuilds, not the initrds that already exist. After a BIOS update: run
 `uninstall`, reboot on the stock tables, run `install` again, reboot. The stock
 tables the override was generated from are kept in
-`/lib/firmware/acpi-override/stock/` for comparison.
+`/lib/firmware/acpi-override/stock/`; `patch` accepts that directory, so a table
+set can be regenerated without booting stock (`install --tables DIR` then loads it).
 
 ## Tested
 
 `tests/corpus.sh` runs `analyze` and `patch` over every Dell dump in a checkout
 of [linuxhw/ACPI](https://github.com/linuxhw/ACPI). Results for the September
-2026 collection are in `docs/corpus-results.md`: 40 of 61 patched and compiled, the
-rest have no DPTF path through the ladders, none failed. Installed from the
-running firmware, booted and verified on an XPS 15 9500 (BIOS 1.40.0): 38 parse
-ops per sensor read instead of 881, no new ACPI errors.
+2026 collection are in `docs/corpus-results.md`: 38 of 61 get both tables, 2 the
+DPTF table only, the rest have no DPTF path through the ladders, none failed.
+Installed from the running firmware, booted and verified on an XPS 15 9500
+(BIOS 1.40.0): 38 parse ops per sensor read instead of 881, 621 per battery
+read instead of 4,383, no new ACPI errors.
 
 ## Safety
 

@@ -104,23 +104,57 @@ class Work:
         self.dsl = {}
 
     def decompile(self, fn):
-        """Disassemble one table. The DSDT needs no external resolution for what we
-        parse from it; an SSDT is tried with the DSDT only, then with every table,
-        because some firmware ships SSDT pairs that conflict when loaded together."""
+        """Disassemble one table. An SSDT is tried with the DSDT as external, then
+        with every table. The DSDT must be disassembled with the SSDTs as externals
+        or references into them do not recompile; when two SSDTs define the same
+        object (a firmware ships variants and loads one), iasl aborts with
+        AE_ALREADY_EXISTS naming the object, so the table that duplicates it is
+        dropped from the external set and the disassembly retried."""
         if fn in self.dsl:
             return self.dsl[fn]
         out = os.path.join(self.tmp, fn[:-4] + ".dsl")
-        attempts = [[]] if fn == self.dsdt else [[self.dsdt], [f for f in self.files if f != fn]]
-        last = None
-        for ext in attempts:
+        others = [f for f in self.files if f != fn]
+
+        def attempt(ext):
             if os.path.exists(out):
                 os.remove(out)
-            last = run(["iasl"] + [x for f in ext for x in ("-e", f)] + ["-d", fn], cwd=self.tmp)
-            if os.path.exists(out):
+            r = run(["iasl"] + [x for f in ext for x in ("-e", f)] + ["-d", fn], cwd=self.tmp)
+            good = os.path.exists(out) and os.path.getsize(out) > 0 and "DefinitionBlock" in open(out, errors="replace").read()
+            return good, r.stdout + r.stderr
+
+        if fn != self.dsdt:
+            plans = [[self.dsdt], others]
+        else:
+            plans = [list(others)]
+        good, log = False, ""
+        for ext in plans:
+            ext = list(ext)
+            for _ in range(8):
+                good, log = attempt(ext)
+                if good:
+                    break
+                m = re.search(r'\[([^\]]+)\], AE_ALREADY_EXISTS', log)
+                if not m or fn != self.dsdt:
+                    break
+                name = m.group(1).split(".")[-1].encode()
+                dup = [f for f in ext if name in open(os.path.join(self.tmp, f), "rb").read()]
+                if len(dup) < 2:
+                    break
+                ext.remove(dup[-1])
+            if good:
                 break
-        if not os.path.exists(out):
-            die(f"iasl could not disassemble {fn}:\n{last.stdout[-2000:]}{last.stderr[-2000:]}")
-        self.dsl[fn] = open(out, encoding="utf-8", errors="replace").read()
+        if not good and fn == self.dsdt:
+            for ext in ([f for f in others if "Dptf" in f], []):
+                good, log = attempt(ext)
+                if good:
+                    break
+        if not good:
+            die(f"iasl could not disassemble {fn}:\n{log[-2000:]}")
+        text = open(out, encoding="utf-8", errors="replace").read()
+        # iasl writes ACPICA diagnostics from loading the external tables into the
+        # .dsl itself; they are not ASL.
+        text = re.sub(r'^(?:Firmware Error \(ACPI\)|ACPI (?:Error|Warning|BIOS Error)):[^\n]*\n', '', text, flags=re.M)
+        self.dsl[fn] = fix_external_artifacts(text)
         return self.dsl[fn]
 
 
@@ -291,6 +325,137 @@ def bump_oem_rev(dsl):
     return dsl[:m.start(2)] + f"0x{new:08X}" + dsl[m.end(2):], int(m.group(2), 16), new
 
 
+
+
+# ------------------------------------------------ disassembly artifact repair
+ARTIFACT = re.compile(
+    r'^(?P<ind>[ \t]*)(?P<head>Return \((?P<n1>\\?[A-Za-z0-9_.^]+)\)|(?P<lhs>[^\n=]+?) = (?P<n2>\\?[A-Za-z0-9_.^]+)|(?P<n3>\\?[A-Za-z0-9_.^]+)) /\* External reference \*/\n'
+    r'(?P<args>(?:[ \t]*(?:Arg\d|Local\d|Zero|One|Ones|0x[0-9A-Fa-f]+|\d+|"[^"\n]*")\n)+)', re.M)
+
+
+def fix_external_artifacts(dsl):
+    """When the disassembler meets a call to a method it cannot see (defined in a
+    table that is loaded at runtime), it emits the name, a comment, and the
+    arguments as bare lines. Turn that back into a call so the result recompiles."""
+    def sub(m):
+        args = [a.strip() for a in m.group("args").strip().split("\n")]
+        call = None
+        if m.group("n1"):
+            call = f"Return ({m.group('n1')} ({', '.join(args)}))"
+        elif m.group("n2"):
+            call = f"{m.group('lhs')} = {m.group('n2')} ({', '.join(args)})"
+        elif m.group("n3"):
+            call = f"{m.group('n3')} ({', '.join(args)})"
+        return f"{m.group('ind')}{call}\n" if call else m.group(0)
+    return ARTIFACT.sub(sub, dsl)
+
+
+# Errors iasl raises about objects that only exist once the firmware's runtime
+# tables are loaded (6084, 6161: object not found; 6086: a name the static dump
+# declares as data but the firmware calls as a method), about a Name created in
+# one method and used from another (6163), and about devices without _HID/_ADR
+# (6141), and a method that calls itself (6152). All are properties of the original firmware, not of the rewrite, and
+# the AML iasl emits for them under -f is what the firmware was built from.
+FORCE_OK = {"6084", "6161", "6163", "6086", "6141", "6152"}
+
+
+def compile_dsl(base, force_allowed=False):
+    """Compile base.dsl to base.aml. Returns (ok, note)."""
+    r = run(["iasl", "-ve", "-p", base, base + ".dsl"])
+    if os.path.exists(base + ".aml"):
+        return True, ""
+    codes = set(re.findall(r'^Error\s+(\d+)', r.stdout + r.stderr, re.M))
+    if force_allowed and codes and codes <= FORCE_OK:
+        for junk in glob.glob(base + ".aml"):
+            os.remove(junk)
+        r = run(["iasl", "-ve", "-f", "-p", base, base + ".dsl"])
+        if os.path.exists(base + ".aml"):
+            return True, f"compiled with -f over iasl errors {' '.join(sorted(codes))} (references to runtime-loaded tables)"
+    first = next((l for l in (r.stdout + r.stderr).splitlines() if l.startswith("Error")), "no iasl output")
+    return False, first[:140]
+
+# ------------------------------------------------------- DSDT ladder rebalance
+LADDER_BLOCK = re.compile(r'^(\s*)If \(\(Arg0 == (' + CONST + r')\)\)\n\s*\{\n[^}]*?\n\s*\}\n', re.M)
+
+
+def fmt_const(c):
+    return f"0x{c:02X}"
+
+
+def tree_text(keys, table, ind, leaf):
+    """Balanced If/Else tree over sorted register numbers. Leaves keep the original
+    equality test so behaviour for unmapped registers is unchanged (no match, no access)."""
+    if len(keys) <= 2:
+        out = []
+        for k in keys:
+            out.append(f"{ind}If ((Arg0 == {fmt_const(k)}))\n{ind}{{\n{ind}    {leaf(table[k])}\n{ind}}}\n")
+        return "".join(out)
+    mid = keys[len(keys) // 2]
+    left = tree_text(keys[:len(keys) // 2], table, ind + "    ", leaf)
+    right = tree_text(keys[len(keys) // 2:], table, ind + "    ", leaf)
+    return f"{ind}If ((Arg0 < {fmt_const(mid)}))\n{ind}{{\n{left}{ind}}}\n{ind}Else\n{ind}{{\n{right}{ind}}}\n"
+
+
+def rebalance_ladder(dsl, name, table, leaf):
+    """Replace the flat if-ladder in method `name` with a balanced tree. Returns (dsl, depth)."""
+    body = find_method(dsl, name)
+    if not body or not table:
+        return dsl, 0
+    blocks = list(LADDER_BLOCK.finditer(body))
+    if len(blocks) < 8:
+        return dsl, 0
+    ind = blocks[0].group(1)
+    keys = sorted(table)
+    new_body = body[:blocks[0].start()] + tree_text(keys, table, ind, leaf) + body[blocks[-1].end():]
+    depth = 1
+    n = len(keys)
+    while n > 2:
+        n = (n + 1) // 2
+        depth += 1
+    return dsl.replace(body, new_body, 1), depth
+
+
+def bump_oem_rev_any(dsl, sig):
+    m = re.search(r'(DefinitionBlock \("", "' + sig + r'", \d, "[^"]*", "[^"]*", )(0x[0-9A-Fa-f]+)\)', dsl)
+    if not m:
+        die(f"DefinitionBlock header not found in {sig}")
+    new = int(m.group(2), 16) + 1
+    return dsl[:m.start(2)] + f"0x{new:08X}" + dsl[m.end(2):], int(m.group(2), 16), new
+
+
+def do_patch_dsdt(work, out_dir, quiet=False):
+    """Rebuild ECR1/ECW1 as balanced trees in a copy of the DSDT. Every caller of the
+    accessors (battery, lid, charger, wake, thermal) gets O(log n) instead of O(n)."""
+    dsdt = work.decompile(work.dsdt)
+    reads, writes, lr, lw = ladder_maps(dsdt)
+    new, d1 = rebalance_ladder(dsdt, "ECR1", reads, lambda f: f"Local0 = {f}")
+    new, d2 = rebalance_ladder(new, "ECW1", writes, lambda f: f"{f} = Arg1")
+    if not d1 and not d2:
+        die("no ECR1/ECW1 ladders of at least 8 blocks in the DSDT; nothing to rebalance")
+    new, old_rev, new_rev = bump_oem_rev_any(new, "DSDT")
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.join(out_dir, "DSDT-patched")
+    with open(base + ".dsl", "w") as f:
+        f.write(new)
+    ok, note = compile_dsl(base, force_allowed=True)
+    if not ok:
+        msg = (f"the rebalanced DSDT does not recompile ({note}); keeping the DPTF table only. "
+               "Battery/lid/charger reads stay on the ladders.")
+        if not quiet:
+            print("warning: " + msg, file=sys.stderr)
+        for junk in glob.glob(base + ".aml"):
+            os.remove(junk)
+        return None
+    if note and not quiet:
+        print("note: DSDT " + note, file=sys.stderr)
+    with open(os.path.join(out_dir, "DSDT.diff"), "w") as f:
+        f.write("".join(difflib.unified_diff(dsdt.splitlines(True), new.splitlines(True), "stock-dsdt.dsl", "patched-dsdt.dsl")))
+    shutil.copy(os.path.join(work.tmp, work.dsdt), os.path.join(out_dir, "DSDT-stock.aml"))
+    if not quiet:
+        print(f"patched DSDT: {base}.aml  (OEM rev 0x{old_rev:X} -> 0x{new_rev:X}); ECR1 {lr} blocks -> tree depth {d1}, ECW1 {lw} blocks -> depth {d2}")
+        print(f"diff: {os.path.join(out_dir, 'DSDT.diff')}")
+    return base + ".aml"
+
 def do_patch(work, out_dir, quiet=False):
     p = plan(work)
     if not p["dptf"]:
@@ -309,9 +474,11 @@ def do_patch(work, out_dir, quiet=False):
     base = os.path.join(out_dir, "SSDT-dptf-patched")
     with open(base + ".dsl", "w") as f:
         f.write(new)
-    r = run(["iasl", "-ve", "-p", base, base + ".dsl"])
-    if not os.path.exists(base + ".aml"):
-        die("iasl failed to compile the patched table:\n" + r.stdout[-3000:] + r.stderr[-3000:])
+    ok, note = compile_dsl(base, force_allowed=True)
+    if not ok:
+        die("iasl failed to compile the patched DPTF table: " + note)
+    if note and not quiet:
+        print("note: DPTF table " + note, file=sys.stderr)
     with open(os.path.join(out_dir, "SSDT-dptf.diff"), "w") as f:
         f.write("".join(difflib.unified_diff(dsl.splitlines(True), new.splitlines(True), "stock.dsl", "patched.dsl")))
     shutil.copy(os.path.join(work.tmp, p["dptf"]), os.path.join(out_dir, "SSDT-dptf-stock.aml"))
@@ -365,6 +532,8 @@ def cmd_patch(a):
     with tempfile.TemporaryDirectory() as td:
         w = Work(tables, td)
         do_patch(w, a.out)
+        if not a.no_dsdt:
+            do_patch_dsdt(w, a.out)
 
 
 def bios_version():
@@ -377,25 +546,37 @@ def bios_version():
 def cmd_install(a):
     if os.geteuid() != 0:
         die("install needs root")
-    aml = a.table
-    if aml is None:
-        if os.path.exists(os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml")):
+    os.makedirs(OVERRIDE_DIR, exist_ok=True)
+    for old in glob.glob(os.path.join(OVERRIDE_DIR, "*.aml")):
+        os.remove(old)
+    if a.tables:
+        amls = sorted(glob.glob(os.path.join(a.tables, "*-patched.aml")))
+        if not amls:
+            die(f"no *-patched.aml in {a.tables}")
+        for aml in amls:
+            shutil.copy(aml, os.path.join(OVERRIDE_DIR, os.path.basename(aml).replace("-patched", "")))
+        for d in glob.glob(os.path.join(a.tables, "*.diff")):
+            shutil.copy(d, OVERRIDE_DIR)
+    else:
+        if os.path.exists(os.path.join(OVERRIDE_DIR, "BIOS_VERSION")) and glob.glob(os.path.join(OVERRIDE_DIR, "stock", "*")):
             die("an override is already installed; the running tables are not stock. "
-                "Use --table with a table patched from the stock tables (kept in "
-                f"{OVERRIDE_DIR}/stock), or uninstall, reboot and install again")
+                f"Run: patch {OVERRIDE_DIR}/stock --out DIR, then install --tables DIR; "
+                "or uninstall, reboot and install again")
         tables = load_tables("/sys/firmware/acpi/tables")
         with tempfile.TemporaryDirectory() as td:
             w = Work(tables, td)
-            aml, _ = do_patch(w, os.path.join(td, "out"))
+            out = os.path.join(td, "out")
+            do_patch(w, out)
+            if not a.no_dsdt:
+                do_patch_dsdt(w, out)
             os.makedirs(os.path.join(OVERRIDE_DIR, "stock"), exist_ok=True)
             for name, b in tables.items():
                 with open(os.path.join(OVERRIDE_DIR, "stock", name + ".aml"), "wb") as f:
                     f.write(b)
-            shutil.copy(aml, os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml"))
-            shutil.copy(os.path.join(td, "out", "SSDT-dptf.diff"), os.path.join(OVERRIDE_DIR, "SSDT-dptf.diff"))
-    else:
-        os.makedirs(OVERRIDE_DIR, exist_ok=True)
-        shutil.copy(aml, os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml"))
+            for aml in glob.glob(os.path.join(out, "*-patched.aml")):
+                shutil.copy(aml, os.path.join(OVERRIDE_DIR, os.path.basename(aml).replace("-patched", "")))
+            for d in glob.glob(os.path.join(out, "*.diff")):
+                shutil.copy(d, OVERRIDE_DIR)
     with open(os.path.join(OVERRIDE_DIR, "BIOS_VERSION"), "w") as f:
         f.write((a.bios_version or bios_version()) + "\n")
     hook = next((h for h in HOOK_SRC_CANDIDATES if os.path.exists(h)), None)
@@ -403,7 +584,8 @@ def cmd_install(a):
         die("initramfs hook not found next to this script (hooks/acpi-override)")
     shutil.copy(hook, HOOK_DST)
     os.chmod(HOOK_DST, 0o755)
-    print(f"installed {OVERRIDE_DIR}/SSDT-dptf.aml (BIOS {open(os.path.join(OVERRIDE_DIR, 'BIOS_VERSION')).read().strip()}) and {HOOK_DST}")
+    installed = sorted(os.path.basename(x) for x in glob.glob(os.path.join(OVERRIDE_DIR, "*.aml")))
+    print(f"installed {' '.join(installed)} in {OVERRIDE_DIR} (BIOS {open(os.path.join(OVERRIDE_DIR, 'BIOS_VERSION')).read().strip()}) and {HOOK_DST}")
     r = subprocess.run(["update-initramfs", "-u", "-k", "all"])
     if r.returncode != 0:
         die("update-initramfs failed")
@@ -411,28 +593,33 @@ def cmd_install(a):
 
 
 def cmd_verify(a):
-    inst = os.path.join(OVERRIDE_DIR, "SSDT-dptf.aml")
-    if not os.path.exists(inst):
-        die(f"{inst} not installed")
-    want = table_header(open(inst, "rb").read())
-    found = None
-    for f in glob.glob("/sys/firmware/acpi/tables/SSDT*"):
+    inst = sorted(glob.glob(os.path.join(OVERRIDE_DIR, "*.aml")))
+    if not inst:
+        die(f"nothing installed in {OVERRIDE_DIR}")
+    loaded = {}
+    for f in glob.glob("/sys/firmware/acpi/tables/*"):
         try:
-            h = table_header(open(f, "rb").read())
-        except PermissionError:
-            die("run as root to read /sys/firmware/acpi/tables")
-        if h["oem_table_id"] == want["oem_table_id"] and h["oem_id"] == want["oem_id"]:
-            found = (f, h)
-    if not found:
-        die("no loaded table matches the installed one")
-    f, h = found
-    ok = h["oem_rev"] == want["oem_rev"]
-    print(f"loaded {f}: {h['oem_table_id']!r} OEM rev 0x{h['oem_rev']:X}; installed override rev 0x{want['oem_rev']:X}: {'ACTIVE' if ok else 'NOT loaded (stock table running)'}")
-    r = run(["dmesg"])
-    for line in r.stdout.splitlines():
+            b = open(f, "rb").read()
+        except (PermissionError, IsADirectoryError):
+            continue
+        if b[:4] in (b"DSDT", b"SSDT"):
+            h = table_header(b)
+            loaded[(h["sig"], h["oem_id"], h["oem_table_id"])] = (f, h)
+    if not loaded:
+        die("run as root to read /sys/firmware/acpi/tables")
+    allok = True
+    for t in inst:
+        want = table_header(open(t, "rb").read())
+        got = loaded.get((want["sig"], want["oem_id"], want["oem_table_id"]))
+        if not got:
+            print(f"{os.path.basename(t)}: no loaded table matches"); allok = False; continue
+        ok = got[1]["oem_rev"] == want["oem_rev"]
+        allok &= ok
+        print(f"{os.path.basename(t)} -> {got[0]}: {want['oem_table_id'].strip()!r} loaded rev 0x{got[1]['oem_rev']:X}, override rev 0x{want['oem_rev']:X}: {'ACTIVE' if ok else 'NOT loaded (stock table running)'}")
+    for line in run(["dmesg"]).stdout.splitlines():
         if "Table Upgrade" in line:
             print("  " + line.strip())
-    sys.exit(0 if ok else 3)
+    sys.exit(0 if allok else 3)
 
 
 def cmd_uninstall(a):
@@ -452,8 +639,8 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True)
     d = sp.add_parser("dump", help="copy firmware tables to a directory"); d.add_argument("--out", default="acpi-tables"); d.add_argument("--from-acpidump", help="acpidump text file instead of /sys"); d.set_defaults(fn=cmd_dump)
     z = sp.add_parser("analyze", help="report ladders and rewritable sites"); z.add_argument("source", help="tables directory, /sys/firmware/acpi/tables, or acpidump text file"); z.set_defaults(fn=cmd_analyze)
-    p = sp.add_parser("patch", help="produce the patched DPTF table"); p.add_argument("source"); p.add_argument("--out", default="patched"); p.set_defaults(fn=cmd_patch)
-    i = sp.add_parser("install", help="install table + initramfs hook (root)"); i.add_argument("--table", help="patched .aml (default: patch the running firmware)"); i.add_argument("--bios-version"); i.set_defaults(fn=cmd_install)
+    p = sp.add_parser("patch", help="produce the patched DPTF table and the rebalanced DSDT"); p.add_argument("source"); p.add_argument("--out", default="patched"); p.add_argument("--no-dsdt", action="store_true", help="only the DPTF SSDT, leave the DSDT alone"); p.set_defaults(fn=cmd_patch)
+    i = sp.add_parser("install", help="install tables + initramfs hook (root)"); i.add_argument("--tables", help="directory produced by patch (default: patch the running firmware)"); i.add_argument("--no-dsdt", action="store_true"); i.add_argument("--bios-version"); i.set_defaults(fn=cmd_install)
     v = sp.add_parser("verify", help="check the override is loaded"); v.set_defaults(fn=cmd_verify)
     u = sp.add_parser("uninstall", help="remove table + hook (root)"); u.set_defaults(fn=cmd_uninstall)
     a = ap.parse_args()
