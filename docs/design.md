@@ -78,3 +78,11 @@ What breaks and what the tool does about it:
   read from another (6163). With `-f` it emits the AML the firmware was built
   from. The tool retries with `-f` only when every error is on that list, and
   otherwise keeps the DPTF table alone.
+
+## Verified on the XPS 15 9500: what the DSDT rebuild actually changes
+
+Disassembling the original firmware DSDT and the installed override with the same externals and
+comparing all 1872 method bodies after normalisation (comments, whitespace, constant widths) shows
+7 differences: `ECR1` and `ECW1`, and five methods where iasl's optimiser re-encodes `X = (X op Y)`
+as `X op= Y` (same value, same target). No method on the s2idle path (LPS0 `_DSM`, `_PTS`, `_PSx`,
+`_DSW`) differs. A future option: compile with `iasl -oa` to leave those five untouched.
